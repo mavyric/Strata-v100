@@ -137,6 +137,16 @@ __device__ __forceinline__ float warp_max(float x) {
     return x;
 }
 
+// Strata#606 port of the llama.cpp#23606 fix: the q8_1 block sum is d * sum(q) - the sum of the QUANTIZED
+// values, ggml-cpu's convention (native_expert_parity.cpp's check_q5_1_min names it as the one the dots must
+// take) - not the fp16 sum of the 32 raw activations.  A large outlier activation overflows that raw fp16 sum
+// to +-inf, every later dot through ds.y turns NaN, and the engine answers one repeated token until it
+// reloads.  d * sum(q) is bounded by 32 * amax; the clamp keeps the residual fp16 overflow (amax > 2047)
+// finite - inf here is what wedged the engine, and a clamped correction term is strictly better than a NaN.
+__device__ __forceinline__ float q8_1_fp16_clamp(float v) {
+    return fminf(fmaxf(v, -65504.0f), 65504.0f);
+}
+
 __launch_bounds__(QUANT_THREADS, 1)
 __global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
                                            Q81Block* __restrict__ y, int n_in) {
@@ -144,11 +154,11 @@ __global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
     if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
     const float xi = x[i];
     const float amax = warp_max(fabsf(xi));
-    const float sum = warp_sum(xi);
-    const float d = amax / 127.0f;
+    const float d = q8_1_fp16_clamp(amax / 127.0f);
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const float sumq = warp_sum((float) q);
     y[i / Q8K].qs[i % Q8K] = q;
-    if (i % Q8K == 0) y[i / Q8K].ds = make_half2(d, sum);
+    if (i % Q8K == 0) y[i / Q8K].ds = make_half2(d, q8_1_fp16_clamp(d * sumq));
 }
 
 // Exact pinned vec_dot_q5_K_q8_1_impl_vmmq expression and integer dot order.
@@ -662,8 +672,10 @@ __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
 }
 
 // The four 32-element formats use native two-byte loads and VDR=2. The affine
-// Q4_0/Q5_0 correction consumes the original-input sum stored in Q8_1, exactly
-// as the pinned CUDA dot does; a signed-integer code substitution would differ.
+// Q4_0/Q5_0 correction consumes the q8_1 sum as d * sum(q) - the quantized sum,
+// ggml-cpu's convention (the #606 fix made the quantizer store exactly that;
+// the pinned CUDA dot's raw-activation sum differs from it only by quantization
+// noise and overflowed fp16 to +-inf on outlier activations).
 __device__ __forceinline__ float small_q8_dot(const Q40Block* __restrict__ w,
                                              const Q81Block* __restrict__ x, int iqs) {
     int sumi = 0;

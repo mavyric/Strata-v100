@@ -401,8 +401,8 @@ __device__ __forceinline__ float vec_dot_q5_K_q8_1(const void* __restrict__ vbq,
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
 // Q5_1: llama.cpp's integer chain, but the min term multiplies the sum of the QUANTIZED activations (dp4a with
-// 0x01010101, times d8) instead of the q8_1 block's `ds.y`, which our quantizer (like llama.cpp's) fills with the sum
-// of the ORIGINAL activations.  That is ggml-cpu's convention (its q8_1 `s` is d * sum(q)) and the one the K-quant
+// 0x01010101, times d8) instead of the q8_1 block's `ds.y`.  Since the #606 fix our quantizer stores d * sum(q)
+// in `ds.y` as well, so the two agree; the dp4a form stays because it is exact in fp32.  That is ggml-cpu's convention (its q8_1 `s` is d * sum(q)) and the one the K-quant
 // mins above use; the scaled and the min term then see the same activation (eddoursul/Strata measured 1.1-1.2%
 // against 1.9% relative error per expert).  Result: sumi * (d5 * d8) + sumu * (m5 * d8).
 // Q5_0: llama.cpp's integer chain verbatim (vecdotq.cuh vec_dot_q5_0_q8_1_impl) -- symmetric (one delta, no
@@ -1018,19 +1018,33 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
 }
 
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
+// Strata#606 port of the llama.cpp#23606 fix: the q8_1 block sum is d * sum(q) - the sum of the QUANTIZED
+// values, ggml-cpu's convention (native_expert_parity.cpp's check_q5_1_min names it as the one the dots must
+// take) - not the fp16 sum of the 32 raw activations.  A large outlier activation overflows that raw fp16 sum
+// to +-inf, every later dot through ds.y turns NaN, and the engine answers one repeated token until it
+// reloads.  d * sum(q) is bounded by 32 * amax; the clamp keeps the residual fp16 overflow (amax > 2047)
+// finite - inf here is what wedged the engine, and a clamped correction term is strictly better than a NaN.
+__device__ __forceinline__ float q8_1_fp16_clamp(float v) {
+    return fminf(fmaxf(v, -65504.0f), 65504.0f);
+}
+
 // value i of a q8_1 row set (the warp holds block i / 32, lane = i % 32)
 __device__ __forceinline__ void q8_1_store(const float xi, block_q8_1* __restrict__ y, const long long i) {
-    float amax = fabsf(xi), sum = xi;
+    float amax = fabsf(xi);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-        sum += __shfl_xor_sync(0xffffffffu, sum, o);
     }
-    const float d = amax / 127.0f;
+    const float d = q8_1_fp16_clamp(amax / 127.0f);
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    float sumq = (float) q;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        sumq += __shfl_xor_sync(0xffffffffu, sumq, o);
+    }
     const long long ib = i / 32, iqs = i % 32;
     y[ib].qs[iqs] = q;
-    if (iqs == 0) y[ib].ds = make_half2(d, sum);
+    if (iqs == 0) y[ib].ds = make_half2(d, q8_1_fp16_clamp(d * sumq));
 }
 
 __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n) {

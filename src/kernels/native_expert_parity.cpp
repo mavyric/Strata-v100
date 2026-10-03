@@ -462,12 +462,14 @@ int check_q5_1_min(cudaStream_t s) {
         tc->vec_dot(n, &stored[r], 0, row, 0, blocks, 0, 1);
     }
     const double e_q = rel(gpu, want), e_s = rel(gpu, stored);
-    // the quantized sum goes through fp16 in ggml-cpu's block (s is a half), so 1e-3 rather than bitwise
-    const bool ok = e_q < 1e-3 && e_s > 10 * e_q && shift > 0.0;
+    // the quantized sum goes through fp16 in ggml-cpu's block (s is a half), so 1e-3 rather than bitwise.
+    // Since the #606 fix the quantizer STORES d * sum(q) in `s`, so `stored` and `want` are the same
+    // blocks and `shift` is only fp16 rounding of d * sum(q); the test now asserts that agreement.
+    const bool ok = e_q < 1e-3 && e_s < 1e-3 && shift < 0.05;  // old raw-sum shift was ~0.114 here
     std::printf("q5_1 min   row 0: GPU %.6g, ggml-cpu (quantized sum) %.6g, (stored sum) %.6g\n", gpu[0], want[0],
                 stored[0]);
-    std::printf("q5_1 min   GPU vs ggml-cpu with s = d*sum(q): rel %.2e; vs s = sum(x) (llama.cpp CUDA's): rel %.2e "
-                "(largest per-block sum shift %.3g)  %s\n", e_q, e_s, shift, ok ? "ok" : "FAIL");
+    std::printf("q5_1 min   GPU vs ggml-cpu with s = d*sum(q): rel %.2e; vs the stored s: rel %.2e "
+                "(largest per-block fp16 rounding of d*sum(q) %.3g)  %s\n", e_q, e_s, shift, ok ? "ok" : "FAIL");
     return ok ? 0 : 1;
 }
 // #290: the BF16 token embedding (--embd-gguf) - iq_embed_rows and iq_dequant_f32 on a random BF16 table against
