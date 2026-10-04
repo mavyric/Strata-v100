@@ -411,6 +411,19 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
 }
 
+void Gemm::f32(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+               float beta) {
+    if (T <= 0 || N <= 0) return;
+    if (ldy <= 0) ldy = N;
+    const float alpha = 1.0f;
+    // Column-major view, as in `bf16`: Y^T[N, T] = W[N, K] (row-major K x N col-major) . X^T[K, T].
+    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                    CUDA_R_32F, (int) K, X, CUDA_R_32F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+       "cublasGemmEx f32");
+    STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f32");
+}
+
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta) {
     if (N * K > scratch_elems_) {

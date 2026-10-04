@@ -84,19 +84,31 @@ class CompatibilityTests(unittest.TestCase):
                 self.assertEqual(native[2], "0")
                 self.assertEqual(native[4], "0")
                 self.assertEqual(native[9], "8")
+            # the router is served as F32 (kind 2): the pack keeps the source values, no 16-bit rounding
+            rrow = rows["blk.0.ffn_gate_inp.weight"]
+            self.assertEqual(rrow[2], "2")
+            roff, rsize = int(rrow[3]), int(rrow[4])
+            self.assertEqual(rsize, 2 * 128 * 4)
+            np.testing.assert_array_equal(np.frombuffer(dense[roff:roff + rsize], dtype=np.float32),
+                                          np.full((2, 128), 0.10001, dtype=np.float32).ravel())
             self.assertNotIn("per_layer_token_embd.weight", rows)
             self.assertEqual(source.read_bytes(), before)
-            self.assertEqual(len(json.loads((root / "compat-bf16.json").read_text())["tensors"]), 6)
+            self.assertEqual(len(json.loads((root / "compat-bf16.json").read_text())["tensors"]), 5)
             conv = json.loads((root / "conversions.json").read_text())
-            self.assertEqual(sorted(r["name"] for r in conv["tensors"]), sorted(names + ["blk.0.ffn_gate_inp.weight"]))
+            self.assertEqual(sorted(r["name"] for r in conv["tensors"]), sorted(names))
 
-    def test_default_still_refuses_inexact_f32_router(self):
+    def test_inexact_f32_router_is_now_kept_exact(self):
+        # The router left the BF16 FORM: an F32 source is stored as F32 (kind 2), so the value that used to be
+        # refused without --compat-bf16 (it is not a BF16 value) is now packed unchanged, with no conversion.
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             source = root / "model.gguf"
             write_gguf(source, [("blk.0.ffn_gate_inp.weight", np.full((2, 32), 0.10001, np.float32), Q.F32)])
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(iq_pack.index_standalone(source, root, iq_pack.Model(source)), 1)
+                self.assertEqual(iq_pack.index_standalone(source, root, iq_pack.Model(source)), 0)
+            _, rows = iq_pack.read_index(root / "index.txt")
+            self.assertEqual(rows["blk.0.ffn_gate_inp.weight"][2], "2")
+            self.assertEqual(json.loads((root / "conversions.json").read_text())["tensors"], [])
 
     def test_existing_bf16_pack_remains_byte_identical(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -408,10 +420,10 @@ class SplitArtifactTests(unittest.TestCase):
             side = json.loads((root / "pack" / "experts.bin.src.json").read_text())
             self.assertEqual([s["name"] for s in side["shards"]], [p.name for p in paths])
             self.assertFalse(list((root / "pack").glob("*.tmp")))
-            # the index: routers as BF16, nothing of the experts
+            # the index: routers as F32 (the source type, kept exact), nothing of the experts
             _, rows = iq_pack.read_index(root / "pack" / "index.txt")
             self.assertNotIn("blk.1.ffn_gate_exps.weight", rows)
-            self.assertEqual(rows["blk.1.ffn_gate_inp.weight"][2], "4")
+            self.assertEqual(rows["blk.1.ffn_gate_inp.weight"][2], "2")
 
     def test_unsplit_layers_keep_the_v3_file(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

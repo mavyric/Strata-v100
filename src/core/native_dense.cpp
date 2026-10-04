@@ -13,8 +13,22 @@
 
 namespace strata::core {
 namespace {
+/// The hyper-connection mixer's eight projections (iq_pack --native-gr).  The two `output_hc_*` names are
+/// global; the six `hc_*` ones are per-layer, matched on the suffix after `blk.N.`.
+bool is_gr_name(const std::string& name) {
+    static const char* gr_names[] = {"hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight",
+        "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight",
+        "output_hc_down.weight", "output_hc_up.weight"};
+    for (const char* gr : gr_names)
+        if (name == gr || name.ends_with(std::string(".") + gr)) return true;
+    return false;
+}
+
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
+    // iq_pack --native-gr: checked BEFORE the `blk.` guard - `output_hc_{down,up}.weight` are global names.
+    // Other types keep their packed form: the GR kernels' native path is the Q8_0 MMVQ.
+    if (is_gr_name(name)) return tensor.type == 8;
     if (name.rfind("blk.", 0) != 0) return false;
     // Match the native PLE kernel: Q2_0, IQ3_XXS, IQ4_XS and Q8_0 (UD-Q4_K_XL). Other keys retain the packed BF16
     // fallback.
@@ -60,6 +74,20 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
     int code_bits = -1;
     if (!WeightTable::index_code_bits(pack_dir, key, code_bits, err)) return false;
     if (code_bits == 0) skip.erase(key);
+    return true;
+}
+
+bool NativeDense::keep_unquantized_gr(const std::string& pack_dir, std::set<std::string>& skip, std::string& err) {
+    // A pack whose GR row is NOT the native Q8_0 form (an old --compat-bf16 pack: kind 4, code_bits 0) serves
+    // the mixer from the arena, so the row comes out of `skip` and `load` does not upload the GGUF over it.
+    std::vector<std::string> keep;
+    for (const auto& name : skip)
+        if (is_gr_name(name)) {
+            int code_bits = -1;
+            if (!WeightTable::index_code_bits(pack_dir, name, code_bits, err)) return false;
+            if (code_bits != 8) keep.push_back(name);
+        }
+    for (const auto& name : keep) skip.erase(name);
     return true;
 }
 
@@ -151,6 +179,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
                 // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
+                // an old (pre --native-gr) pack holds the GR projections as BF16 rows: the arena serves them
+                if (is_gr_name(tensor.name) && !ref.quantized()) continue;
                 if (!ref.quantized() || tensor.shape.size() != 2 ||
                     ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
                     tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {

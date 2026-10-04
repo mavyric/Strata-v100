@@ -1714,10 +1714,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
                 else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo);
                 normed = false;
-                if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
+                // iq_pack --native-gr: native Q8_0 rows go through `native_proj` (BF16 activations, the same
+                // path the GDN projections use); the BF16 low-residual correction is a packed-form refinement
+                // the Q8_1 quantization inside `native_proj` subsumes.
+                const bool gr_nat = wd->native_data != nullptr;
+                if (gr_nat ? !native_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err)
+                           : !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
-                if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
-                if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
+                if (gr_nat ? !native_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)
+                           : !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                if (gr_nat ? !native_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)
+                           : !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
                 if (gr_unfused()) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                               m.mixed_bf_lo);
@@ -1952,7 +1959,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                           *wsd = need(v, "ffn_down_shexp.weight", err);
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     pt.mark(kPfRouter, cs);
-                    if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    // An F32 pack row (kind 2) routes through the FP32 GEMM on the FP32 activations; a BF16 row
+                    // keeps the tensor-core path on the rounded activation, exactly as before.
+                    if (wr->kind == core::WeightKind::F32) {
+                        if (!wr->data) { err = "prefill: the F32 router has no resident bytes"; return false; }
+                        m.gemm.f32(m.mixed, (const float*) wr->data, m.logits, T, wr->ne1, wr->ne0);
+                    } else if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     // the shared expert and its scalar gate
                     if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;

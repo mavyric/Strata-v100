@@ -49,4 +49,13 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream);
 
+/// The same MMVF reduction tree with an F32 weight: pair accumulation, adaptive block size, warp-XOR
+/// reduction, two ordered FMAs per pair - so the ONLY difference from bf16_gemv_fp32_mmvf is that the
+/// weight values are exact instead of bf16-rounded.  For the router, whose logits decide a discrete
+/// top-k: the GEMV is <1% of a token, and the pack keeps the source F32 values.
+/// Same constraints as bf16_gemv_fp32_mmvf: positive even n_in, positive n_out, x 8-byte aligned.
+void f32_gemv_fp32_mmvf(const float* x, const float* w, float* y, int64_t n_in, int64_t n_out, void* stream);
+void f32_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const float* w, float* y, int64_t ldy,
+                              int64_t n_in, int64_t n_out, int n_tok, void* stream);
+
 }  // namespace strata::kernels

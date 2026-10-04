@@ -353,8 +353,10 @@ q8k_bytes(g.n_embd),
 };    uint64_t total = 0;    for (uint64_t v : parts) total += (v + 15) & ~(uint64_t) 15;    return total;}
 uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuffers& b) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2, (uint64_t) g.n_embd * 2, (uint64_t) g.n_expert * 4,        (uint64_t) k * 4, (uint64_t) k * 4, (uint64_t) g.n_embd * 4,        strata::kernels::shared_expert_scratch_bytes(g.n_ff),        (uint64_t) (g.n_embd / 32) * 34, q8k_bytes(g.n_embd),    };    uint8_t* p = (uint8_t*) base;    void* ptr[9];    uint64_t total = 0;    for (int i = 0; i < 9; ++i) {        ptr[i] = p;        const uint64_t al = (parts[i] + 15) & ~(uint64_t) 15;        p += al;        total += al;    }    b.x_bf16 = (uint16_t*) ptr[0];    b.x_f16 = (uint16_t*) ptr[1];    b.logits = (float*) ptr[2];    b.ids = (int*) ptr[3];    b.weights = (float*) ptr[4];    b.shared = (float*) ptr[5];    b.sh_scratch = (float*) ptr[6];    b.x_q8_0 = (uint8_t*) ptr[7];    b.x_q8k = (uint8_t*) ptr[8];    return total;}
 bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,               const float* x, void* stream, std::string& err, const Doorbell* db) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_router = v.get("ffn_gate_inp.weight");    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }    if (k < 1 || k > 64) { err = "moe_route: k must be 1..64"; return false; }
-// ---- the router's activation.  The router's weight is BF16 and that is the one `ref/moe.py` singles out.
-if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
+// ---- the router's activation.  The router's weight is BF16 (old packs) or F32 (iq_pack's default since the
+// router stopped being rounded to 16 bits); `ref/moe.py` singles this tensor out, so its form is checked, not
+// assumed.  The BF16 image of the activation is only needed by the BF16 GEMV.
+if (!native_bf16_projections && w_router->kind != WeightKind::F32) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 // ---- logits = ffn_gate_inp @ bf16(x).  The weight is BF16, so this is `bf16_gemv` and not `s_gemv` -
 //      and using the fp16 activation here instead is the 8.100e-03 error that flips a selection.
 //
@@ -364,7 +366,13 @@ if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 //      memory-bound floor and the largest single item left inside the MoE after the top-10 was fixed.
 //      `bf16_gemv_split` exists for precisely this case; its own header says so.  Measured here:
 //      LEDGER L41 -> L42.
-project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
+//      An F32 pack row (kind 2) takes `f32_gemv_fp32_mmvf`: the same reduction tree with the weight read as
+//      float, so a bf16-valued F32 weight reproduces the BF16 GEMV's result bit for bit (the Q8_0/GSQ source
+//      files store the router as F32 whose values ARE bf16's - the old pack's conversion was exact).
+if (w_router->kind == WeightKind::F32) {
+    try { f32_gemv_fp32_mmvf(x, (const float*) w_router->data, b.logits, g.n_embd, g.n_expert, stream); }
+    catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
+} else project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 // the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
 if (native_router_enabled() && g.n_expert == 512 && k == 10) {
@@ -1066,15 +1074,19 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
         err = "lm_head: an output_hc_* weight is missing";
         return false;
     }
-    if (wn->kind != WeightKind::F32 || wd->kind != WeightKind::Bf16InF32 ||
-        wu->kind != WeightKind::Bf16InF32) {
+    if (wn->kind != WeightKind::F32 ||
+        (!wd->native_data && (wd->kind != WeightKind::Bf16InF32 || wu->kind != WeightKind::Bf16InF32))) {
         err = "lm_head: the output_hc_* weights have the wrong engine forms";
         return false;
     }
     const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+    strata::kernels::GrNativeWeights ng;
+    if (wd->native_data) {
+        ng.down = wd->native_data; ng.up = wu->native_data; ng.q8_1 = wd->native_q8_1;   // no inject row
+    }
     strata::kernels::gr_read(bb.R, (const float*) wn->data, (const uint16_t*) wd->data,
                             (const uint16_t*) wu->data, nullptr, RMS_EPS, gs, bb.gr,
-                            bb.mixed, bb.inject, stream);
+                            bb.mixed, bb.inject, stream, ng.down ? &ng : nullptr);
     return true;
 }
 
@@ -1157,7 +1169,11 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
     //
     // So the driver calls `ple_stage_token` once per token, BEFORE the graphs, and what is captured here is only
     // the device half: `ple_block` reading `emb_dev`, and the history shift.
-    const bool fused = g_fused_gr && stage_prefix == 0 && half == 0 &&
+    // iq_pack --native-gr: the fused kernel reads the BF16 arena copies; a native pack has none (resident is
+    // false, data is null), so the unfused `gr_read` with the native struct serves the mixer instead.
+    const WeightRef* gr_probe = tables.find(("blk." + std::to_string(layer) + ".hc_attn_down.weight").c_str());
+    const bool gr_native = gr_probe != nullptr && gr_probe->native_data != nullptr;
+    const bool fused = g_fused_gr && !gr_native && stage_prefix == 0 && half == 0 &&
                        strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr);
     // layer-1's FFN write has not been applied to R yet - unless a control vector follows it, which needs R
     bool pending_ffn = fused && layer > 0 && !strata::kernels::cvec().covers(layer - 1);
@@ -1203,7 +1219,23 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
 const char* pre[2] = {"hc_attn_", "hc_ffn_"};    const WeightRef* w_norm[2];    const WeightRef* w_down[2];    const WeightRef* w_up[2];    const WeightRef* w_inject[2];    for (int h = 0; h < 2; ++h) {        const std::string a = std::string(pre[h]) + "norm.weight";        const std::string d = std::string(pre[h]) + "down.weight";        const std::string u = std::string(pre[h]) + "up.weight";        const std::string i = std::string(pre[h]) + "inject.weight";        w_norm[h] = v.get(a.c_str());        w_down[h] = v.get(d.c_str());        w_up[h] = v.get(u.c_str());        w_inject[h] = v.get(i.c_str());        if (!w_norm[h] || !w_down[h] || !w_up[h] || !w_inject[h]) {            err = v.name((std::string(pre[h]) + "{norm,down,up,inject}.weight").c_str()) + " is missing";            return false;        }
 // The GR weights are BF16 and the arena holds them re-rounded to 2 B/elem.  `gr_read` wants exactly
 // that; handing it f32 bytes would walk 2x the tensor inside the arena without faulting.
-if (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf16InF32 ||            w_inject[h]->kind != WeightKind::Bf16InF32 || w_norm[h]->kind != WeightKind::F32) {            err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16)";            return false;        }    }
+if (w_norm[h]->kind != WeightKind::F32) {
+        err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32)";
+        return false;
+    }
+    // iq_pack --native-gr: the three projections are served as native GGUF Q8_0 (no arena copy); the
+    // packed form still requires all three BF16 rows resident.
+    if (!w_down[h]->native_data &&
+        (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf16InF32 ||
+         w_inject[h]->kind != WeightKind::Bf16InF32)) {
+        err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16)";
+        return false;
+    }
+    if (w_down[h]->native_data && (!w_up[h]->native_data || !w_inject[h]->native_data)) {
+        err = v.name(pre[h]) + "mixes native and packed GR projections";
+        return false;
+    }
+    }
 // ---- half 1: the mixer
 float* R = bb.R;
     // R0.11: WHICH STAGES TO RUN.  `stage_prefix == 0` means "as `half` says", so every caller that predates
@@ -1224,7 +1256,7 @@ st_begin(layer, 0, stream);
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    gr_read(R, (const float*) w_norm[0]->data, (const uint16_t*) w_down[0]->data,            (const uint16_t*) w_up[0]->data, (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    {        strata::kernels::GrNativeWeights ng;        if (w_down[0]->native_data) {            ng.down = w_down[0]->native_data; ng.up = w_up[0]->native_data;            ng.inject = w_inject[0]->native_data; ng.q8_1 = w_down[0]->native_q8_1;        }        gr_read(R, (const float*) w_norm[0]->data, (const uint16_t*) w_down[0]->data,                (const uint16_t*) w_up[0]->data, (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr,                bb.mixed, bb.inject, stream, ng.down ? &ng : nullptr);    }
     }
     st_end(layer, 0, stream);    dump_half(bb, g, layer, bb.inject, 2 * g.n_embd, g.hc, stream);        }
     if (run1) {
@@ -1247,7 +1279,7 @@ st_begin(layer, 3, stream);
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject2; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    gr_read(R, (const float*) w_norm[1]->data, (const uint16_t*) w_down[1]->data,            (const uint16_t*) w_up[1]->data, (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    {        strata::kernels::GrNativeWeights ng;        if (w_down[1]->native_data) {            ng.down = w_down[1]->native_data; ng.up = w_up[1]->native_data;            ng.inject = w_inject[1]->native_data; ng.q8_1 = w_down[1]->native_q8_1;        }        gr_read(R, (const float*) w_norm[1]->data, (const uint16_t*) w_down[1]->data,                (const uint16_t*) w_up[1]->data, (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr,                bb.mixed, bb.inject, stream, ng.down ? &ng : nullptr);    }
     }
     st_end(layer, 3, stream);        }
     if (run4) {

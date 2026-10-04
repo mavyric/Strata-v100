@@ -107,9 +107,20 @@ inline size_t gr_workspace_bytes(const GrShapes& s) { GrWorkspace w; return gr_w
 /// This version splits the work the way the shapes want: `hc` blocks for the per-stream norm, one warp per
 /// row for each of the two projections, and one block-tile for the mean.  The transposes are gone because the
 /// warp-per-row mapping makes them unnecessary.
+/// iq_pack --native-gr: the mixer's three projections served as native GGUF Q8_0 blocks instead of BF16 copies
+/// (the source type of every Q8_0/GSQ file; the V100 has no hardware BF16 path, so the repack was pure
+/// overhead).  Given to `gr_read` when the pack's GR rows are shape-only; `q8_1` is the caller's shared
+/// activation scratch (`native_q8_1_bytes(hc * n_embd)`), used on the same ordered stream as the kernels.
+struct GrNativeWeights {
+    const void* down = nullptr;    ///< Q8_0 blocks, [hc_lr][hc*n_embd]
+    const void* up = nullptr;      ///< Q8_0 blocks, [hc*n_embd][hc_lr]
+    const void* inject = nullptr;  ///< Q8_0 blocks, [hc][hc*n_embd], or null (the final mixer)
+    void* q8_1 = nullptr;          ///< shared Q8_1 activation scratch
+};
+
 void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const uint16_t* w_up,
              const uint16_t* w_inject, float eps, const GrShapes& s, const GrWorkspace& ws, float* mixed,
-             float* inject, void* stream);
+             float* inject, void* stream, const GrNativeWeights* native = nullptr);
 
 /// `build_hc_combine`.  `R_out[i] = R[i] + block_out[d] * w[c]` with `w[c] = 2*sigmoid(inject[c]/hc)`.
 ///

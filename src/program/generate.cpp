@@ -75,6 +75,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <bit>
 #include <chrono>
 #include <algorithm>
 #include <iostream>
@@ -1982,6 +1983,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (native_pack && !strata::core::NativeDense::keep_unquantized_gr(o.pack, skip, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
         if (native_pack) skip.insert("token_embd.weight");
     }
     uint64_t pool_bytes = 0;
@@ -3288,11 +3293,28 @@ int main(int argc, char** argv) {
         bool ok = true;
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {
             const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
-            ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
-                 w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
+            // The lookahead's CPU kernel takes BF16 bits.  An F32 pack row (kind 2) is narrowed here once at
+            // startup - exact for the Q8_0/GSQ files, whose F32 router values ARE bf16's, and the lookahead is
+            // a prefetch heuristic either way.
+            const bool bf16_row = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
+                                  w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
+            const bool f32_row = w != nullptr && w->kind == strata::core::WeightKind::F32 &&
+                                 w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 4;
+            ok = bf16_row || f32_row;
             if (!ok) break;
             routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
-            ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+            if (bf16_row) {
+                ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+            } else {
+                std::vector<float> f(routers[(size_t) l].size());
+                ok = cudaMemcpy(f.data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+                if (ok)
+                    for (size_t i = 0; i < f.size(); ++i) {   // ggml's round-to-nearest-even f32->bf16
+                        const uint32_t bits = std::bit_cast<uint32_t>(f[i]);
+                        const uint32_t rounding = 0x7FFFu + ((bits >> 16) & 1u);
+                        routers[(size_t) l][i] = (uint16_t) ((bits + rounding) >> 16);
+                    }
+            }
         }
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, &src, err)) {

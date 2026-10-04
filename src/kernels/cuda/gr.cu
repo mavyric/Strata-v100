@@ -25,6 +25,7 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_gr_norm.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
 
 #include <cuda_runtime.h>
@@ -343,7 +344,7 @@ size_t gr_workspace_init(const GrShapes& s, void* base, GrWorkspace& out) {
 
 void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const uint16_t* w_up,
              const uint16_t* w_inject, float eps, const GrShapes& s, const GrWorkspace& ws, float* mixed,
-             float* inject, void* stream) {
+             float* inject, void* stream, const GrNativeWeights* native) {
     if (s.n_embd <= 0 || s.hc <= 0 || s.hc_lr <= 0) return;
     if (ws.xn == nullptr || ws.xq == nullptr || ws.lq == nullptr || ws.gated == nullptr || ws.lo == nullptr) {
         std::fprintf(stderr, "gr_read: GrWorkspace is not initialised (see gr_workspace_init)\n");
@@ -358,6 +359,40 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
     const int hc_dim = (int) (s.hc * s.n_embd);
     cudaStream_t st = (cudaStream_t) stream;
 
+    // iq_pack --native-gr: the three projections are native GGUF Q8_0 and run through the MMVQ, on the SAME
+    // FP32-activation kernels as the native MMVF path below (norm, silu, pre-gated).  The V100 has no hardware
+    // BF16 path, so the BF16 copies this replaces were re-rounded data the kernel then widened again; Q8_0 is
+    // 1.0625 B/elem against their 2, and the MMVQ is the engine's tuned 8-bit GEMV.  The activation is
+    // quantized to Q8_1 per projection (down and inject reduce hc_dim, up reduces hc_lr) into the caller's
+    // scratch, which every native tensor in the table shares on the one ordered session stream.
+    if (native != nullptr && native->down != nullptr) {
+        if (native->q8_1 == nullptr) throw std::invalid_argument("gr_read native GR requires q8_1 scratch");
+        native_gr_rms_norm_weighted(R, w_norm, ws.xn, n_embd, hc, eps, stream);
+        native_quantize_q8_1(ws.xn, native->q8_1, hc_dim, 1, stream);
+        native_q8_0_mmvq(native->down, native->q8_1, ws.lo, hc_dim, hc_lr, 1, stream);
+        native_gr_down_silu(ws.lo, hc_lr, hc, stream);
+        native_quantize_q8_1(ws.lo, native->q8_1, hc_lr, 1, stream);
+        native_q8_0_mmvq(native->up, native->q8_1, ws.gated, hc_lr, hc_dim, 1, stream);
+        // The null-injection contract identifies the final mixer, same as the packed forms'.
+        native_gr_pre_gated(ws.xn, ws.gated, mixed, n_embd, hc, native->inject != nullptr, stream);
+        if (native->inject != nullptr) {
+            native_quantize_q8_1(ws.xn, native->q8_1, hc_dim, 1, stream);
+            native_q8_0_mmvq(native->inject, native->q8_1, inject, hc_dim, hc, 1, stream);
+        }
+        const cudaError_t ne = cudaGetLastError();
+        if (ne != cudaSuccess) {
+            std::fprintf(stderr, "gr_read native launch: %s\n", cudaGetErrorString(ne));
+            std::exit(1);
+        }
+        if (stream == nullptr) {
+            const cudaError_t se = cudaDeviceSynchronize();
+            if (se != cudaSuccess) {
+                std::fprintf(stderr, "gr_read native: %s\n", cudaGetErrorString(se));
+                std::exit(1);
+            }
+        }
+        return;
+    }
     // One setting selects every projection in this call. Captured graphs retain these kernel variants.
     const bool use_native = native_mmvf;
     const bool use_fp32 = fp32_activations || use_native;

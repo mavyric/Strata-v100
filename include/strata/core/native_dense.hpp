@@ -29,6 +29,9 @@ public:
     /// the native kernel also reads, e.g. OrcaRouter's IQ3_XXS) serves the PLE from that row, so it is taken out
     /// of `skip` and `load` does not upload the GGUF key over it.  A quantized row leaves `skip` unchanged.
     static bool keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip, std::string& err);
+    /// The same rule for the hyper-connection mixer (iq_pack --native-gr): a pack whose GR rows are not the
+    /// native Q8_0 form (an old --compat-bf16 pack) serves them from the arena, so those rows leave `skip`.
+    static bool keep_unquantized_gr(const std::string& pack_dir, std::set<std::string>& skip, std::string& err);
     uint64_t weight_bytes() const { return bytes_; }
     size_t tensor_count() const { return weights_.size(); }
 

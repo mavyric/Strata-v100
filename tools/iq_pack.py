@@ -71,7 +71,9 @@ NOT_IN_PACK = {"per_layer_token_embd.weight"}      # the 28.8 GB PLE table: read
 #   F16 / BF16 -> F32                                               exact widening, by default
 # Tensors not named here are written as stored (floats) or served from the GGUF (quantized), as before.
 FORM = {
-    "ffn_gate_inp.weight": "BF16", "ffn_gate_inp_shexp.weight": "BF16",
+    # The router is served as F32 (the source type of every Q8_0/GSQ file): the GEMV is <1% of a token, so
+    # the pack keeps the exact values instead of rounding them to a 16-bit form.
+    "ffn_gate_inp.weight": "F32", "ffn_gate_inp_shexp.weight": "BF16",
     "hc_attn_down.weight": "BF16", "hc_attn_up.weight": "BF16", "hc_attn_inject.weight": "BF16",
     "hc_ffn_down.weight": "BF16", "hc_ffn_up.weight": "BF16", "hc_ffn_inject.weight": "BF16",
     "output_hc_down.weight": "BF16", "output_hc_up.weight": "BF16",
@@ -88,10 +90,20 @@ FORM = {
 # keys take the BF16 path (--compat-bf16), as before.
 NATIVE_PLE_KEY = {"Q2_0", "Q8_0"}
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
+# --native-gr: the hyper-connection mixer reads these natively as Q8_0 from the GGUF (the engine's MMVQ path),
+# so they take a shape-only index row instead of a BF16 copy.  A Q8_0 source is 1.0625 B/elem and the BF16
+# copy is 2 - on a GPU without a hardware BF16 path the repack is pure overhead.
+NATIVE_GR = {"hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight",
+             "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight",
+             "output_hc_down.weight", "output_hc_up.weight"}
+native_gr = False
 
 
 def form_of(name: str):
-    return FORM.get(re.sub(r"^blk\.\d+\.", "", name))
+    bare = re.sub(r"^blk\.\d+\.", "", name)
+    if native_gr and bare in NATIVE_GR:
+        return None
+    return FORM.get(bare)
 
 
 def needs_bf16(name: str, type_name: str) -> bool:
@@ -499,11 +511,16 @@ def main() -> int:
     ap.add_argument("--compat-bf16", action="store_true",
                     help="dequantize small non-native projections to BF16 for ordinary Qwen4Exp GGUFs "
                          "(rounds weights; leaves experts and the PLE table unchanged)")
+    ap.add_argument("--native-gr", action="store_true",
+                    help="serve the hyper-connection mixer (hc_*, output_hc_*) natively as Q8_0 from the GGUF "
+                         "instead of a BF16 copy (engine built with the native GR path; run with --native)")
     ap.add_argument("--experts-bin", action="store_true",
                     help="also write experts.bin (the engine otherwise reads the experts from the GGUF itself)")
     a = ap.parse_args()
     if a.compat_bf16 and a.base:
         ap.error("--compat-bf16 cannot reuse --base dense weights")
+    global native_gr
+    native_gr = a.native_gr
     # HF snapshot files are symlinks to hash-named blobs. Keep the shard filename for discovery: .absolute(), not
     # .resolve(), which would follow the link to the blob and lose the -0000N-of-0000M name.
     src = pathlib.Path(a.gguf).absolute()

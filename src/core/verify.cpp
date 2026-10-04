@@ -492,6 +492,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             pending = false;
         }
         auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+            // iq_pack --native-gr: the fused kernel reads the BF16 arena copies, which a native pack does not
+            // have.  The unfused sequence - the write the fused kernel folds in, then `gr_read` with the native
+            // struct - reproduces the decode path exactly, which is what the window must do.
+            if (wd[half]->native_data) {
+                for (int t = tb; t < te; ++t) {
+                    if (apply) gr_write(Rt(t), bo_ + t * N, inj_prev + t * HC, gs, Rt(t), cs);
+                    strata::kernels::GrNativeWeights ng;
+                    ng.down = wd[half]->native_data; ng.up = wu[half]->native_data;
+                    ng.inject = wi[half]->native_data; ng.q8_1 = wd[half]->native_q8_1;
+                    BlockBuffers bb = ss.block;
+                    bb.R = Rt(t);
+                    gr_read(bb.R, (const float*) wn[half]->data, nullptr, nullptr, nullptr, EPS, gs, bb.gr,
+                            mixed_ + t * N, inj_out + t * HC, cs, &ng);
+                }
+                return;
+            }
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = tb; t < te; ++t) {
                 FusedGrArgs& a = fa[t - tb];
@@ -676,8 +692,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
-                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
-                                          NE, n, cs);
+                if (w_router->kind == WeightKind::F32)
+                    f32_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const float*) w_router->data, logits_ + tb * NE, NE, N,
+                                             NE, n, cs);
+                else
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
+                                              NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
         } else
